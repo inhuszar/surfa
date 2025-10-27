@@ -532,7 +532,11 @@ class Mesh:
                              f'the number of mesh faces, but instead got {overlay.shape[0]}')
         overlay = cast_overlay(overlay)
   
-        shape = (self.nvertices, overlay.nframes)
+        # Bugfix: singleton dimension (2025-Oct-27, INH)
+        if overlay.nframes != 1:
+            shape = (self.nvertices, overlay.nframes)
+        else:
+            shape = (self.nvertices,)
 
         method = str(method).lower()
         if method == 'mean':
