@@ -16,3 +16,8 @@ docs/reference/api
 /wheelhouse
 
 .coverage
+
+# Project-specific
+surfa-*.md
+surfa-*.tar.gz
+
