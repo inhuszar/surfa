@@ -93,7 +93,9 @@ def interpolate(source, target_shape, method, affine=None, disp=None, fill=0):
     # ensure correct byteorder
     # TODO maybe this should be done at read-time?
     swap_byteorder = sys.byteorder == 'little' and '>' or '<'
-    source = source.byteswap().newbyteorder() if source.dtype.byteorder == swap_byteorder else source
+    if source.dtype.byteorder == swap_byteorder:
+        # NumPy 2 removed ndarray.newbyteorder(); use a dtype view instead.
+        source = source.byteswap().view(source.dtype.newbyteorder('='))
 
     # a few types aren't supported, so let's just convert to float and convert back if necessary
     unsupported_dtype = None
