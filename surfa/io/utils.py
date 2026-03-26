@@ -64,7 +64,9 @@ def write_int(file, value, size=4, signed=True, byteorder='big'):
     byteorder : str
         Memory byte order.
     """
-    file.write(value.to_bytes(size, byteorder=byteorder, signed=signed))
+    # to avoid 'AttributeError: 'numpy.int32' object has no attribute 'to_bytes'' in numpy 2.0,
+    # cast numpy.int32 to a native Python int
+    file.write(int(value).to_bytes(size, byteorder=byteorder, signed=signed))
 
 
 def read_bytes(file, dtype, count=1):
