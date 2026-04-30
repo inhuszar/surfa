@@ -126,7 +126,7 @@ class Freeview:
             mesh_filename = mesh
         else:
             mesh = cast_mesh(mesh, allow_none=False)
-            mesh_filename = _unique_filename('mesh', '', self.tempdir)
+            mesh_filename = _unique_filename('mesh', 'srf', self.tempdir)
             mesh.save(mesh_filename)
             if self.debug:
                 print(f'wrote mesh to {mesh_filename}')
@@ -170,8 +170,8 @@ class Freeview:
         if name is not None:
             tags += f':name={name}'
         
-        # add the path to the temp vol to the internal list of volumes
-        self._meshes.append(filename)
+        # add the path to the temp mesh to the internal list of meshes
+        self._meshes.append(mesh_filename)
 
         # configure the corresponding freeview argument
         self.arguments.append('-f ' + mesh_filename + tags + _convert_kwargs_to_tags(kwargs))
@@ -338,6 +338,8 @@ def _find_vgl():
     Locate the VGL wrapper if installed.
     """
     have_key = os.path.isfile('/etc/opt/VirtualGL/vgl_xauth_key')
+    # test for egl support
+    has_egl = os.path.isfile('/opt/VirtualGL/bin/eglinfo')
     vgl_path = shutil.which('vglrun')
     if vgl_path is None:
         vgl_path = shutil.which('vglrun', path='/usr/pubsw/bin')
@@ -346,6 +348,9 @@ def _find_vgl():
     islocal = any([os.environ.get('DISPLAY', '').endswith(string) for string in (':0', ':0.0')])
     no_glx = 'NV-GLX' in collect_output('xdpyinfo')[0]
     if not islocal and not no_glx:
+        # add flag for egl if supported
+        if has_egl:
+            vgl_path = vgl_path + ' -d egl'
         return vgl_path
     return None
 

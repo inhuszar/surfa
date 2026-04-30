@@ -64,7 +64,9 @@ def write_int(file, value, size=4, signed=True, byteorder='big'):
     byteorder : str
         Memory byte order.
     """
-    file.write(value.to_bytes(size, byteorder=byteorder, signed=signed))
+    # to avoid 'AttributeError: 'numpy.int32' object has no attribute 'to_bytes'' in numpy 2.0,
+    # cast numpy.int32 to a native Python int
+    file.write(int(value).to_bytes(size, byteorder=byteorder, signed=signed))
 
 
 def read_bytes(file, dtype, count=1):
@@ -86,7 +88,16 @@ def read_bytes(file, dtype, count=1):
         The read dtype array.
     """
     dtype = np.dtype(dtype)
-    value = np.frombuffer(file.read(dtype.itemsize * count), dtype=dtype)
+
+    # numpy.frombuffer() creates a read-only array if the input buffer is immutable
+    # to get a writable array
+    # 1. create a mutable buffer (bytearray) of a specific size
+    buffer_size = dtype.itemsize * count
+    buf = bytearray(buffer_size)
+    file.readinto(buf)
+
+    # 2. pass the mutable buffer to frombuffer
+    value = np.frombuffer(buf, dtype=dtype)
     if count == 1:
         return value[0]
     return value
