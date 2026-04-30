@@ -35,6 +35,7 @@ from .io import load_warp
 from .io import load_timeseries
 
 from . import vis
+from .vis import fv
 from . import freesurfer
 from . import pipeline
 
