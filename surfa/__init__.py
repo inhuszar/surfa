@@ -2,7 +2,7 @@
 # SURFA
 #
 
-__version__ = '0.6.3'
+__version__ = '0.6.3+inhuszar.1'
 
 from . import system
 
