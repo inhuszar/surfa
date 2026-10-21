@@ -12,6 +12,7 @@ from surfa.mesh.overlay import cast_overlay
 from surfa.mesh.overlay import Overlay
 from surfa.mesh.sphere import mesh_is_sphere
 from surfa.mesh.intersection import triangle_intersections
+from surfa.mesh.robust_intersection import self_intersecting_face_pairs
 from surfa.transform import ImageGeometry
 from surfa.transform import image_geometry_equal
 from surfa.transform import cast_image_geometry
@@ -637,6 +638,44 @@ class Mesh:
         if overlay:
             return intersecting
         return selected[intersecting]
+
+    def find_self_intersecting_faces_robust(self, tolerance=1e-10, overlay=False, return_pairs=False):
+        """
+        Locate faces that intersect other faces, with a test that does not depend on floating-point round-off.
+
+        `find_self_intersecting_faces` tests each face against its `knn` nearest faces in single precision
+        with an absolute epsilon, so near-contacts between almost coplanar faces are reported or not depending
+        on round-off: the count can change by hundreds of faces under a rigid motion, a rescaling or a
+        perturbation below the float32 resolution of the coordinates. This method instead tests every pair of
+        faces whose bounding spheres overlap, in double precision, with signed-volume predicates relative to
+        the pair and a tolerance relative to the pair's size. A pair intersects when an edge of one face
+        properly crosses the other. The result is invariant to translation, rotation and uniform scaling.
+
+        Faces sharing an edge are never reported; faces sharing one vertex are reported when the edge of
+        either face opposite the shared vertex crosses the other. Contacts within the tolerance and coplanar
+        overlaps are not reported.
+
+        Parameters
+        ----------
+        tolerance : float
+            Relative tolerance: a signed volume below `tolerance * L^3` (L the longest edge of the pair)
+            counts as zero, so contacts closer than about `tolerance * L` are not intersections.
+        overlay : bool
+            If this is enabled, the return value will be a face overlay marking intersecting faces.
+        return_pairs : bool
+            If this is enabled, also return the (P, 2) array of intersecting face pairs.
+
+        Returns
+        -------
+        intersecting : int array or Overlay
+            Indices of intersecting faces, or a boolean face overlay if `overlay` is enabled; followed by the
+            pairs if `return_pairs` is enabled.
+        """
+        pairs = self_intersecting_face_pairs(self.vertices, self.faces, tolerance=tolerance)
+        mask = np.zeros(self.nfaces, dtype=bool)
+        mask[pairs.ravel()] = True
+        result = Overlay(mask) if overlay else np.flatnonzero(mask)
+        return (result, pairs) if return_pairs else result
 
     def remove_self_intersections(self, smoothing_iters=2, global_iters=50, knn=50, verbose=False):
         """
