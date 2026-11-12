@@ -6,7 +6,7 @@ from surfa.io import check_file_readability
 from surfa.transform import Affine
 
 
-def load_affine(filename, fmt=None):
+def load_affine(filename, fmt=None, **kwargs):
     """
     Load an `Affine` from file.
 
@@ -17,6 +17,9 @@ def load_affine(filename, fmt=None):
     fmt : str, optional
         Forced file format. If None (default), file format is extrapolated
         from extension.
+    **kwargs
+        Extra keyword arguments passed to the format-specific loader, such as
+        the `source` and `target` geometries of a register.dat file.
 
     Returns
     -------
@@ -34,7 +37,7 @@ def load_affine(filename, fmt=None):
         if iop is None:
             raise ValueError(f'unknown file format {fmt}')
 
-    return iop().load(filename)
+    return iop().load(filename, **kwargs)
 
 
 def save_affine(aff, filename, fmt=None):
