@@ -27,6 +27,8 @@ from surfa.io.utils import write_bytes
 from surfa.io.utils import read_geom
 from surfa.io.utils import write_geom
 from surfa.io.utils import check_file_readability
+from surfa.transform.geometry import ImageGeometry
+from surfa.transform.geometry import image_geometry_equal
 
 
 def load_volume(filename, fmt=None):
@@ -88,7 +90,8 @@ def load_overlay(filename, fmt=None):
 
 def load_warp(filename, fmt=None):
     """
-    Load an image `Warp` from a 3D or 4D array file.
+    Load an image `Warp` from a 3D or 4D array file, or from a FreeSurfer m3z morph,
+    which loads in abs_crs format (see `FreeSurferM3ZIO`).
 
     Parameters
     ----------
@@ -740,6 +743,254 @@ class NiftiArrayIO(protocol.IOProtocol):
         self.nib.save(nii, filename)
 
 
+class FreeSurferM3ZIO(protocol.IOProtocol):
+    """
+    Warp IO protocol for FreeSurfer GCA morph files (.m3z, gzip-compressed, and the
+    uncompressed .m3d), as written by `GCAMwrite()` and read by `GCAMread()` in
+    FreeSurfer's utils/gcamorph.cpp (`__m3zWrite()` and `__m3zRead()`).
+
+    File layout, all values big-endian:
+
+        float   version (1.0, the only version FreeSurfer defines)
+        int     width, height, depth (node grid), spacing (atlas voxels per node)
+        float   exp_k
+        per node, x outermost and z innermost:
+            float origx, origy, origz   original (pre-morph) node position
+            float x, y, z               current node position in source (image) voxels
+            int   xn, yn, zn            node index
+        tags, each an int ID without a data length:
+            TAG_GCAMORPH_GEOM (10)      source (image) then target (atlas) VOL_GEOM
+            TAG_GCAMORPH_TYPE (11)      int, GCAM_VOX (2) or GCAM_RAS (1)
+            TAG_GCAMORPH_LABELS (12)    int label per node, in node order
+            TAG_MGH_XFORM (31)          optional linear transform, written by
+                                        `znzWriteMatrix()` as an int tag (0), a 64-bit
+                                        length and a 1600-byte text buffer; older
+                                        files hold `MatrixAsciiWriteInto()` text
+                                        instead, which is read but not written
+
+    Node (i, j, k) sits at target voxel (i, j, k) * spacing, and its position (x, y, z)
+    is the absolute source voxel coordinate it maps to. An m3z file is therefore a
+    `Warp.Format.abs_crs` warp. For spacing 1, the warp's target geometry is the atlas
+    geometry. For a coarser node grid, the target geometry is the node grid
+    (atlas vox2ras scaled by the spacing), and the atlas geometry and spacing are kept
+    in the metadata keys 'm3z-atlas' and 'm3z-spacing' so that saving writes them back.
+
+    On save, the warp is converted to abs_crs. The original node positions, the node
+    labels and the linear transform are kept in the metadata keys 'm3z-orig',
+    'm3z-labels' and 'm3z-affine' when present. Without them, the original positions are
+    written as node indices and the labels as zeros, as FreeSurfer does when it converts
+    an mgz warp to m3z, and no linear transform is written.
+    """
+
+    name = 'm3z'
+    extensions = ('.m3z', '.m3d')
+
+    version = 1.0
+    gcam_ras = 1
+    gcam_vox = 2
+    matrix_strlen = 4 * 4 * 100
+
+    # per-node record of __m3zWrite()
+    node_dtype = np.dtype([('orig', '>f4', 3), ('pos', '>f4', 3), ('index', '>i4', 3)])
+
+    def _open(self, filename, mode):
+        """
+        Open an m3z (gzip) or m3d (plain) file, as FreeSurfer decides by extension.
+        """
+        if str(filename).lower().endswith('.m3z'):
+            return gzip.open(filename, mode)
+        return open(filename, mode)
+
+    def load(self, filename, atype):
+        """
+        Read a warp from a FreeSurfer m3z file.
+
+        Parameters
+        ----------
+        filename : str or Path
+            File path to read.
+        atype : class
+            FramedArray subclass to load. Must be `Warp`.
+
+        Returns
+        -------
+        Warp
+            Warp in abs_crs format, indexed by target voxel.
+        """
+        if atype is not Warp:
+            raise ValueError(f'{filename} is an m3z morph and can only be loaded as a Warp')
+
+        with self._open(filename, 'rb') as file:
+
+            version = read_bytes(file, '>f4')
+            if version != self.version:
+                raise ValueError(f'unsupported m3z version {version} in {filename}')
+
+            shape = tuple(int(n) for n in read_bytes(file, '>i4', 3))
+            spacing = int(read_bytes(file, '>i4'))
+            exp_k = float(read_bytes(file, '>f4'))
+
+            count = int(np.prod(shape))
+            buffer = file.read(count * self.node_dtype.itemsize)
+            if len(buffer) != count * self.node_dtype.itemsize:
+                raise ValueError(f'{filename} ends before its {shape} node grid')
+            nodes = np.frombuffer(buffer, dtype=self.node_dtype).reshape(shape)
+
+            source = atlas = None
+            source_valid = target_valid = True
+            source_fname = target_fname = ''
+            gcam_type = self.gcam_vox
+            labels = None
+            affine = None
+
+            # tag loop of __m3zRead(): every tag is lengthless except the matrix
+            # that follows TAG_MGH_XFORM, which carries its own tag and length
+            while True:
+                fbytes = file.read(4)
+                if len(fbytes) < 4:
+                    break
+                tag = int(np.frombuffer(fbytes, dtype='>i4')[0])
+                if tag == 0:
+                    break
+                elif tag == fsio.tags.gcamorph_geom:
+                    # file names are C strings: keep what precedes the first null
+                    source, source_valid, source_fname = read_geom(file)
+                    atlas, target_valid, target_fname = read_geom(file)
+                    source_fname = source_fname.split('\x00', 1)[0]
+                    target_fname = target_fname.split('\x00', 1)[0]
+                elif tag == fsio.tags.gcamorph_type:
+                    gcam_type = int(read_bytes(file, '>i4'))
+                elif tag == fsio.tags.gcamorph_labels:
+                    labels = read_bytes(file, '>i4', count).reshape(shape)
+                elif tag == fsio.tags.xform:
+                    head = file.read(4)
+                    if head == bytes(4):
+                        # znzWriteMatrix(): tag 0, 64-bit length, 'Matrix' and 16 values
+                        length = int(read_bytes(file, '>i8'))
+                        text = file.read(length).decode('utf-8').split('\x00', 1)[0]
+                        values = text.split()[1:17]
+                    else:
+                        # older files: MatrixAsciiWriteInto() text, 'type rows cols'
+                        # and 16 values, up to the end of the file
+                        text = (head + file.read()).decode('utf-8').split()
+                        values = text[3:19]
+                    affine = np.asarray(values, dtype=np.float64).reshape(4, 4)
+                else:
+                    raise ValueError(f'unknown tag {tag} in m3z file {filename}')
+
+        if gcam_type != self.gcam_vox:
+            raise NotImplementedError('only m3z morphs with voxel node positions '
+                                      f'(GCAM_VOX) are supported, {filename} has type '
+                                      f'{gcam_type}')
+
+        # target geometry: the atlas itself or, for a coarser grid, the node grid
+        metadata = {}
+        if atlas is None:
+            target = None
+        elif spacing == 1 and tuple(atlas.shape) == shape:
+            target = atlas
+        else:
+            scale = np.diag([spacing, spacing, spacing, 1.0])
+            target = ImageGeometry(shape=shape, vox2world=atlas.vox2world.matrix @ scale)
+            metadata['m3z-atlas'] = atlas
+            metadata['m3z-spacing'] = spacing
+
+        data = np.array(nodes['pos'], dtype=np.float32)
+        warp = Warp(data, source=source, target=target, format=Warp.Format.abs_crs)
+
+        warp.metadata.update(metadata)
+        warp.metadata['source-valid'] = source_valid
+        warp.metadata['source-fname'] = source_fname
+        warp.metadata['target-valid'] = target_valid
+        warp.metadata['target-fname'] = target_fname
+        warp.metadata['exp_k'] = exp_k
+        warp.metadata['m3z-orig'] = np.array(nodes['orig'], dtype=np.float32)
+        if labels is not None and np.any(labels):
+            warp.metadata['m3z-labels'] = labels.astype(np.int32)
+        if affine is not None:
+            warp.metadata['m3z-affine'] = affine
+        return warp
+
+    def save(self, arr, filename):
+        """
+        Write a warp to a FreeSurfer m3z file.
+
+        Parameters
+        ----------
+        arr : Warp
+            Warp to save, in any format. It is converted to abs_crs.
+        filename : str or Path
+            Target file path.
+        """
+        if not isinstance(arr, Warp):
+            raise ValueError('only a Warp can be saved as an m3z morph')
+        if arr.basedim != 3 or arr.nframes != 3:
+            raise ValueError(f'm3z morphs must be 3D warps, got shape {arr.shape}')
+        if arr.source is None:
+            raise ValueError('saving an m3z morph requires a source geometry')
+
+        shape = tuple(arr.baseshape)
+        meta = arr.metadata
+        data = arr.convert(Warp.Format.abs_crs, copy=False).data
+
+        # restore the atlas and spacing of a coarse node grid, but only if the
+        # target geometry is still the node grid derived from them
+        atlas, spacing = arr.target, 1
+        coarse_atlas = meta.get('m3z-atlas')
+        coarse_spacing = int(meta.get('m3z-spacing', 1))
+        if coarse_atlas is not None and coarse_spacing > 1:
+            scale = np.diag([coarse_spacing, coarse_spacing, coarse_spacing, 1.0])
+            node_grid = ImageGeometry(shape=shape,
+                                      vox2world=coarse_atlas.vox2world.matrix @ scale)
+            if image_geometry_equal(node_grid, arr.target, tol=1e-4):
+                atlas, spacing = coarse_atlas, coarse_spacing
+
+        nodes = np.empty(shape, dtype=self.node_dtype)
+        index = np.stack(np.meshgrid(*(np.arange(n) for n in shape), indexing='ij'), -1)
+        orig = meta.get('m3z-orig')
+        if orig is None or np.shape(orig) != (*shape, 3):
+            orig = index
+        nodes['orig'] = orig
+        nodes['pos'] = data
+        nodes['index'] = index
+
+        labels = meta.get('m3z-labels')
+        if labels is None or np.shape(labels) != shape:
+            labels = np.zeros(shape, dtype=np.int32)
+
+        with self._open(filename, 'wb') as file:
+            write_bytes(file, self.version, '>f4')
+            write_bytes(file, shape, '>i4')
+            write_bytes(file, spacing, '>i4')
+            write_bytes(file, meta.get('exp_k', 0.0), '>f4')
+            file.write(nodes.tobytes())
+
+            write_int(file, fsio.tags.gcamorph_geom)
+            write_geom(file,
+                       geom=arr.source,
+                       valid=meta.get('source-valid', True),
+                       fname=meta.get('source-fname', ''))
+            write_geom(file,
+                       geom=atlas,
+                       valid=meta.get('target-valid', True),
+                       fname=meta.get('target-fname', ''))
+
+            write_int(file, fsio.tags.gcamorph_type)
+            write_int(file, self.gcam_vox)
+
+            write_int(file, fsio.tags.gcamorph_labels)
+            write_bytes(file, np.ravel(labels), '>i4')
+
+            affine = meta.get('m3z-affine')
+            if affine is not None:
+                affine = np.asarray(affine, dtype=np.float64).reshape(4, 4)
+                text = 'Matrix ' + ' '.join('%10f' % v for v in affine.ravel())
+                write_int(file, fsio.tags.xform)
+                write_int(file, 0)
+                write_bytes(file, self.matrix_strlen, '>i8')
+                file.write(text.encode('utf-8').ljust(self.matrix_strlen, b'\x00'))
+
+
 class FreeSurferAnnotationIO(protocol.IOProtocol):
     """
     Array IO protocol for 1D mesh annotation files.
@@ -966,6 +1217,7 @@ class TIFFArrayIO(ImageSliceIO):
 array_io_protocols = [
     MGHArrayIO,
     NiftiArrayIO,
+    FreeSurferM3ZIO,
     FreeSurferAnnotationIO,
     FreeSurferCurveIO,
     JPEGArrayIO,
