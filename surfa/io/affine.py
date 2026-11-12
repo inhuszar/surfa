@@ -285,8 +285,140 @@ class MNITransformIO(protocol.IOProtocol):
                 fp.write(line + "\n")
 
 
+class RegisterDatIO(protocol.IOProtocol):
+    """
+    Affine IO protocol for FreeSurfer register.dat files, as written by
+    tkregister2, bbregister and lta_convert --outreg.
+
+    The file holds a subject name, the in-plane and between-plane resolutions
+    (mm), an intensity scale, a 4x4 matrix R and an optional float2int token
+    ('tkregister', 'floor' or 'round'). R maps the tkregister (surface) RAS of
+    the target (reference, anatomical) volume to the tkregister RAS of the
+    movable volume, that is MovRAS = R @ TargRAS (see `tkregister2 --help`).
+    This is the reverse of surfa's source-to-target convention, so the loaded
+    `Affine` holds the inverse of R, with source = movable and target =
+    reference, matching the LTA that `lta_convert --inreg` writes.
+
+    The extension '.dat' is generic. It is claimed only among the affine IO
+    protocols (`load_affine`, `Affine.save`), and the loader raises an error
+    if the file does not parse as a register.dat file.
+    """
+
+    name = 'regdat'
+    extensions = ('.dat', '.reg')
+    float2int_methods = ('tkregister', 'floor', 'round')
+
+    def load(self, filename, source=None, target=None):
+        """
+        Read affine from a register.dat file.
+
+        The file stores no image geometry, so the transform can only be given
+        in tkregister space. Pass the movable and reference geometries to
+        convert it to scanner RAS with `aff.convert(space='world')`.
+
+        Parameters
+        ----------
+        filename : str
+            File path to read.
+        source : castable ImageGeometry, optional
+            Movable (source) image geometry.
+        target : castable ImageGeometry, optional
+            Reference (target) image geometry.
+
+        Returns
+        -------
+        Affine
+            Affine object loaded from file, in 'surf' space. The header fields
+            are kept in `metadata` under the keys 'subject', 'inplaneres',
+            'betplaneres', 'intensity' and 'float2int' (None if absent).
+        """
+        # tokenise like regio_read_register(), which reads with fscanf
+        with open(filename, 'r') as file:
+            tokens = file.read().split()
+
+        if len(tokens) < 20:
+            raise ValueError(f'{filename} does not look like a register.dat file')
+        try:
+            inplaneres, betplaneres, intensity = (float(t) for t in tokens[1:4])
+            matrix = np.asarray(tokens[4:20], dtype=np.float64).reshape(4, 4)
+        except ValueError:
+            raise ValueError(f'{filename} does not look like a register.dat file')
+
+        float2int = tokens[20] if len(tokens) > 20 else None
+        if float2int is not None and float2int not in self.float2int_methods:
+            raise ValueError(f'unknown float2int method {float2int!r} in {filename}')
+
+        metadata = {
+            'subject': tokens[0],
+            'inplaneres': inplaneres,
+            'betplaneres': betplaneres,
+            'intensity': intensity,
+            'float2int': float2int,
+        }
+
+        # the file maps target to source, surfa maps source to target
+        return Affine(np.linalg.inv(matrix), source=source, target=target,
+                      space='surf', metadata=metadata)
+
+    def save(self, aff, filename):
+        """
+        Write affine to a register.dat file.
+
+        An affine not in 'surf' space is converted to it, which requires both
+        source and target geometries. Header fields are taken from
+        `aff.metadata` when present, otherwise subject 'subject-unknown', the
+        source voxel size, intensity 0.1 and float2int 'round', as
+        lta_convert writes them.
+
+        Parameters
+        ----------
+        aff : Affine
+            Array to save.
+        filename : str
+            Target file path.
+        """
+        if aff.ndim != 3:
+            raise NotImplementedError('register.dat only supports 3D transforms')
+
+        # interpret 'space' like the LTA writer does
+        space = aff.space or 'vox'
+        if space != 'surf':
+            if aff.source is None or aff.target is None:
+                raise ValueError(f'cannot write affine in {space} space to register.dat '
+                                 'without both source and target geometries')
+            aff = Affine(aff.matrix, source=aff.source, target=aff.target, space=space,
+                         metadata=aff.metadata).convert(space='surf')
+
+        # the file maps target to source, surfa maps source to target
+        matrix = np.linalg.inv(aff.matrix)
+
+        voxsize = aff.source.voxsize if aff.source is not None else (1.0, 1.0, 1.0)
+        meta = aff.metadata
+        subject = meta.get('subject', 'subject-unknown')
+        inplaneres = meta.get('inplaneres', voxsize[0])
+        betplaneres = meta.get('betplaneres', voxsize[2])
+        intensity = meta.get('intensity', 0.1)
+        float2int = meta.get('float2int', 'round')
+        if float2int is not None and float2int not in self.float2int_methods:
+            raise ValueError(f'unknown float2int method {float2int!r}')
+
+        # same layout as regio_write_register()
+        with open(filename, 'w') as file:
+            file.write(f'{subject}\n')
+            file.write('%f\n' % inplaneres)
+            file.write('%f\n' % betplaneres)
+            file.write('%f\n' % intensity)
+            file.write('%.15e %.15e %.15e %.15e\n' % tuple(matrix[0]))
+            file.write('%.15e %.15e %.15e %.15e\n' % tuple(matrix[1]))
+            file.write('%.15e %.15e %.15e %.15e\n' % tuple(matrix[2]))
+            file.write('0 0 0 1\n')
+            if float2int is not None:
+                file.write(f'{float2int}\n')
+
+
 # enabled affine IO protocol classes
 affine_io_protocols = [
     LinearTransformArrayIO,
     MNITransformIO,
+    RegisterDatIO,
 ]
