@@ -11,7 +11,7 @@ from surfa.core.istype import isimage
 
 class Affine:
 
-    def __init__(self, matrix, source=None, target=None, space=None):
+    def __init__(self, matrix, source=None, target=None, space=None, metadata=None):
         """
         N-D transform, represented by an (N+1, N+1) affine matrix, that
         tracks source and target geometries as well as coordinate space.
@@ -26,18 +26,23 @@ class Affine:
             Transform target (or fixed) image geometry.
         space : Space
             Coordinate space of the transform.
+        metadata : dict, optional
+            Dictionary containing arbitrary transform metadata, such as
+            the header fields of a FreeSurfer register.dat file.
         """
         # init internal parameters
         self._matrix = None
         self._space = None
         self._source = None
         self._target = None
+        self._metadata = {}
 
         # set the actual values
         self.matrix = matrix
         self.space = space
         self.source = source
         self.target = target
+        self.metadata = metadata
 
     def __repr__(self):
         with np.printoptions(precision=4, suppress=True):
@@ -155,6 +160,21 @@ class Affine:
     def target(self, value):
         self._check_writeability()
         self._target = transform.cast_image_geometry(value, copy=True)
+
+    @property
+    def metadata(self):
+        """
+        dict : Dictionary to store various metadata associated with the transform.
+        """
+        return self._metadata
+
+    @metadata.setter
+    def metadata(self, value):
+        """
+        Replace the metadata dictionary. Will always make a deep copy of the new dictionary.
+        """
+        self._check_writeability()
+        self._metadata = copy.deepcopy(value) if value is not None else {}
 
     def save(self, filename):
         """
@@ -386,7 +406,8 @@ class Affine:
         # the matrix multiplication above should propagate space and geometry info
         # correctly, but in a few cases, the matmul is skipped, so let's just return
         # a new affine object with the correct information
-        return Affine(affine.matrix, source=source, target=target, space=space)
+        return Affine(affine.matrix, source=source, target=target, space=space,
+                      metadata=self.metadata)
 
     # the implementation is based on FramedImage.transform
     def __transform_image(self, image, method='linear', rotation='corner', resample=True, fill=0):
